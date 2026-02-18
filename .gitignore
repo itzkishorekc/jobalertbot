@@ -1,0 +1,4 @@
+.env
+seen_jobs.sqlite3
+__pycache__/
+venv/
