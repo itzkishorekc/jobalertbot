@@ -185,6 +185,7 @@ def tg_send(bot_token: str, chat_id: str, text: str) -> None:
             r.raise_for_status()
             return
 
+
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             # backoff + jitter
             sleep_s = min(30, 2 ** attempt) + random.random()
@@ -193,6 +194,30 @@ def tg_send(bot_token: str, chat_id: str, text: str) -> None:
 
     # If we get here, all retries failed
     raise RuntimeError("Failed to send Telegram message after multiple retries.")
+
+def get_target_chat_ids() -> list[str]:
+    ids: list[str] = []
+
+    # Primary target (your channel)
+    main_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if main_id:
+        ids.append(main_id)
+
+    # Optional admin DM
+    admin_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "").strip()
+    if admin_id and admin_id not in ids:
+        ids.append(admin_id)
+
+    if not ids:
+        raise RuntimeError("No Telegram chat IDs configured.")
+    return ids
+
+
+def tg_send_multi(bot_token: str, chat_ids: list[str], text: str) -> None:
+    for cid in chat_ids:
+        tg_send(bot_token, cid, text)
+        time.sleep(1.1)  # avoid flooding / resets
+
 
 def chunk_lines(lines: List[str], max_chars: int = 3800) -> List[str]:
     # Telegram hard limit is 4096 chars; keep buffer for safety
@@ -211,7 +236,7 @@ def chunk_lines(lines: List[str], max_chars: int = 3800) -> List[str]:
 
 def main():
     bot_token = must_env("TELEGRAM_BOT_TOKEN")
-    chat_id = must_env("TELEGRAM_CHAT_ID")
+    chat_ids = get_target_chat_ids()
     adzuna_id = must_env("ADZUNA_APP_ID")
     adzuna_key = must_env("ADZUNA_APP_KEY")
 
@@ -251,7 +276,7 @@ def main():
             mark_seen(con, job_key)
 
     if not new_lines:
-        tg_send(bot_token, chat_id, "No new sponsor-licensed mechanical jobs found today.")
+        tg_send_multi(bot_token, chat_ids, "No new sponsor-licensed mechanical jobs found today.")
         return
 
     # Optional: sort for nicer digests
@@ -261,7 +286,7 @@ def main():
     chunks = chunk_lines([header] + new_lines)
 
     for i, msg in enumerate(chunks):
-        tg_send(bot_token, chat_id, msg)
+        tg_send_multi(bot_token, chat_ids, msg)
     time.sleep(1.1)  # keep under 1 msg/sec for the same chat
 
 
