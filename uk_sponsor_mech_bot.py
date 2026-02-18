@@ -48,18 +48,7 @@ QUERIES = [
 FUZZY_THRESHOLD = 92
 MAX_JOBS_PER_QUERY = 50
 
-def get_meta(con, key: str) -> str | None:
-    cur = con.execute("SELECT value FROM meta WHERE key = ?", (key,))
-    row = cur.fetchone()
-    return row[0] if row else None
 
-def set_meta(con, key: str, value: str) -> None:
-    con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value))
-    con.commit()
-
-def london_today_str() -> str:
-    tz = zoneinfo.ZoneInfo("Europe/London")
-    return datetime.now(tz).strftime("%Y-%m-%d")
 
 def must_env(name: str) -> str:
     v = os.getenv(name)
@@ -230,11 +219,6 @@ def main():
     sponsors = load_sponsors()
     con = init_db()
 
-    today = london_today_str()
-    last_run = get_meta(con, "last_run_date")
-    if last_run == today:
-      return  # already ran today
-    set_meta(con, "last_run_date", today)
 
     new_lines: List[str] = []
 
@@ -283,5 +267,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
