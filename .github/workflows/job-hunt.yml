@@ -38,7 +38,7 @@ jobs:
           echo "uk_hour=$HOUR" >> $GITHUB_OUTPUT
 
       - name: Run bot (only at 17:00 UK time)
-        if: steps.uk_time.outputs.uk_hour == '17'
+        if: steps.uk_time.outputs.uk_hour == '17' || github.event_name == 'workflow_dispatch'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
