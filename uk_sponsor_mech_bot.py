@@ -223,7 +223,7 @@ def main():
     today = london_today_str()
     last_run = get_meta(con, "last_run_date")
     if last_run == today:
-    return  # already ran today
+      return  # already ran today
     set_meta(con, "last_run_date", today)
 
     new_lines: List[str] = []
@@ -273,3 +273,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
