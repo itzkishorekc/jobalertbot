@@ -148,14 +148,24 @@ def fetch_adzuna_jobs(app_id: str, app_key: str, what: str, results_per_page: in
 
 def init_db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
+
     con.execute("""
         CREATE TABLE IF NOT EXISTS seen (
             job_key TEXT PRIMARY KEY,
             first_seen INTEGER
         )
     """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
     con.commit()
     return con
+
 
 def already_seen(con: sqlite3.Connection, job_key: str) -> bool:
     cur = con.execute("SELECT 1 FROM seen WHERE job_key = ?", (job_key,))
@@ -273,4 +283,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
