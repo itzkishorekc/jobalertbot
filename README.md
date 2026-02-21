@@ -41,7 +41,10 @@ This bot automates the workflow:
 ### 1) Install dependencies
 ```bash
 pip install requests beautifulsoup4 pandas rapidfuzz python-dotenv
-2) Create .env
+```
+### 2) Create .env
+
+```
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_channel_or_group_id
 TELEGRAM_ADMIN_CHAT_ID=your_personal_chat_id   # optional but recommended
@@ -52,8 +55,12 @@ ADZUNA_APP_KEY=your_adzuna_app_key
 # Optional debug mode
 DEBUG_REJECTIONS=1
 DEBUG_REJECTIONS_LIMIT=15
+```
+
 3) Run
+```
 python uk_sponsor_mech_bot.py
+```
 Output format (Telegram)
 
 Each job is sent in this format:
