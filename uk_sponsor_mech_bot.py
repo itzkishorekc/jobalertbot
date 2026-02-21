@@ -1,13 +1,14 @@
 """
-Daily UK sponsor-licensed mechanical job digest -> Telegram
+Daily UK sponsor-licensed engineering job digest -> Telegram
 Format per line: Job title + company name + location + job posting link
 
 Requirements:
-  pip install requests beautifulsoup4 pandas rapidfuzz
+  pip install requests beautifulsoup4 pandas rapidfuzz python-dotenv
 
 Env vars:
   TELEGRAM_BOT_TOKEN = api telegram
-  TELEGRAM_CHAT_ID = id telegram
+  TELEGRAM_CHAT_ID = id telegram (channel/group)
+  TELEGRAM_ADMIN_CHAT_ID = optional admin DM id
   ADZUNA_APP_ID = id
   ADZUNA_APP_KEY = key
 """
@@ -15,46 +16,292 @@ Env vars:
 import os
 import re
 import time
-import json
 import sqlite3
-from typing import Optional, Dict, List, Tuple
+import random
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from typing import Optional, Dict, List, Iterable, Set, Any
+
 from dotenv import load_dotenv
 load_dotenv()
 
 import requests
-import random
-from datetime import datetime
-import zoneinfo
 import pandas as pd
 from bs4 import BeautifulSoup
 from rapidfuzz import process, fuzz
 
 SPONSOR_PAGE = "https://www.gov.uk/government/publications/register-of-licensed-sponsors-workers"
-
 ADZUNA_ENDPOINT = "https://api.adzuna.com/v1/api/jobs/gb/search/1"
 DB_PATH = os.path.join(os.path.dirname(__file__), "seen_jobs.sqlite3")
 
-# Tune these search terms any time you want
+# ---------------------------------
+# Search queries (tune anytime)
+# ---------------------------------
 QUERIES = [
-    "mechanical engineer",
-    "mechanical design engineer",
-    "design engineer mechanical",
-    "cad engineer solidworks",
-    "product design engineer mechanical",
-    "manufacturing engineer mechanical",
-    "maintenance engineer mechanical",
+    "mechatronics engineer",
+    "electromechanical engineer",
+    "automation engineer manufacturing",
+    "industrial automation engineer",
+    "controls engineer plc",
+    "junior controls engineer",
+    "robotics integration engineer",
+    "robotics applications engineer",
+    "product development engineer electromechanical",
+    "npi engineer manufacturing",
+    "digital manufacturing engineer",
+    "industry 4.0 engineer",
+    "manufacturing systems engineer",
+    "manufacturing process engineer automation",
+    "test validation engineer electromechanical",
+    "product test engineer mechanical",
+    "reliability engineer manufacturing",
+    "simulation engineer mechanical matlab",
+    "cae engineer ansys",
+    "commissioning engineer automation",
 ]
 
+# Sponsor name fuzzy threshold (rapidfuzz token_sort_ratio out of 100)
 FUZZY_THRESHOLD = 92
 MAX_JOBS_PER_QUERY = 50
 
+# ---------------------------------
+# Relevance / scoring config lists
+# ---------------------------------
+TARGET_JOB_TITLES = [
+    # Mechatronics / Electromechanical
+    "Mechatronics Engineer",
+    "Electromechanical Engineer",
+    "Mechatronics Design Engineer",
+    "Electro-Mechanical Design Engineer",
+    "Systems Integration Engineer",
+    "Electromechanical Systems Engineer",
+
+    # Automation / Controls
+    "Automation Engineer",
+    "Industrial Automation Engineer",
+    "Manufacturing Automation Engineer",
+    "Controls Engineer",
+    "Controls and Automation Engineer",
+    "Control Systems Engineer",
+    "Junior Controls Engineer",
+    "PLC Engineer",
+    "Automation Project Engineer",
+    "Commissioning Engineer",
+
+    # Robotics
+    "Robotics Engineer",
+    "Robotics Integration Engineer",
+    "Robotics Applications Engineer",
+    "Robot Integration Engineer",
+    "Robot Cell Integration Engineer",
+    "Automation and Robotics Engineer",
+
+    # Product Development / R&D
+    "Product Development Engineer",
+    "Electromechanical Product Development Engineer",
+    "Design and Development Engineer",
+    "R&D Engineer",
+    "Research and Development Engineer",
+    "NPI Engineer",
+    "New Product Introduction Engineer",
+
+    # Manufacturing / Digital Manufacturing
+    "Manufacturing Engineer",
+    "Manufacturing Process Engineer",
+    "Process Engineer",
+    "Production Engineer",
+    "Digital Manufacturing Engineer",
+    "Industry 4.0 Engineer",
+    "Smart Manufacturing Engineer",
+    "Manufacturing Systems Engineer",
+    "Industrial Digitalization Engineer",
+    "Continuous Improvement Engineer",
+
+    # Test / Validation / Reliability
+    "Test Engineer",
+    "Validation Engineer",
+    "Test and Validation Engineer",
+    "Verification and Validation Engineer",
+    "V&V Engineer",
+    "Product Test Engineer",
+    "Reliability Engineer",
+    "Reliability Test Engineer",
+
+    # Simulation / Analysis
+    "CAE Engineer",
+    "Simulation Engineer",
+    "Modelling and Simulation Engineer",
+    "Design Analysis Engineer",
+    "Computational Engineer",
+
+    # Technical / Field / Applications
+    "Field Application Engineer",
+    "Applications Engineer",
+    "Technical Solutions Engineer",
+    "Field Service Engineer",
+]
+
+TITLE_KEYWORDS = [
+    # Core identity
+    "mechatronics",
+    "electromechanical",
+    "electro-mechanical",
+    "automation",
+    "controls",
+    "control systems",
+    "plc",
+    "robotics",
+    "systems integration",
+    "integration engineer",
+
+    # Product / design / development
+    "product development",
+    "design and development",
+    "r&d",
+    "research and development",
+    "npi",
+    "new product introduction",
+
+    # Manufacturing / process / digital
+    "manufacturing engineer",
+    "manufacturing process",
+    "process engineer",
+    "production engineer",
+    "digital manufacturing",
+    "smart manufacturing",
+    "industry 4.0",
+    "manufacturing systems",
+    "industrial digitalization",
+    "continuous improvement",
+
+    # Test / validation / reliability
+    "test engineer",
+    "validation engineer",
+    "verification",
+    "v&v",
+    "product test",
+    "reliability",
+
+    # Analysis / simulation
+    "cae",
+    "simulation engineer",
+    "modelling",
+    "modeling",
+    "design analysis",
+
+    # Customer-facing industrial roles
+    "applications engineer",
+    "field application",
+    "field service engineer",
+    "technical solutions engineer",
+    "commissioning engineer",
+]
+
+DESCRIPTION_INCLUDE_KEYWORDS = [
+    # Mechanical / product
+    "mechanical design",
+    "product development",
+    "electromechanical",
+    "mechatronics",
+    "prototype",
+    "design for manufacture",
+    "dfm",
+    "testing",
+    "validation",
+    "root cause analysis",
+
+    # Automation / controls
+    "automation",
+    "industrial automation",
+    "plc",
+    "scada",
+    "control systems",
+    "instrumentation",
+    "commissioning",
+    "sensors",
+    "actuators",
+
+    # Manufacturing / process
+    "manufacturing",
+    "process improvement",
+    "continuous improvement",
+    "production",
+    "lean",
+    "digital manufacturing",
+    "industry 4.0",
+    "manufacturing systems",
+
+    # Software / analysis edge
+    "python",
+    "matlab",
+    "data analysis",
+    "automation scripts",
+    "simulation",
+    "ansys",
+    "solidworks",
+    "fusion 360",
+]
+
+EXCLUDE_KEYWORDS = [
+    # Too senior (early-career focus)
+    "senior",
+    "lead",
+    "principal",
+    "head of",
+    "director",
+
+    # Pure software roles (not primary target)
+    "frontend",
+    "backend",
+    "full stack",
+    "react developer",
+    "android developer",
+    "ios developer",
+    "web developer",
+
+    # Unrelated engineering domains (optional)
+    "civil engineer",
+    "architectural",
+    "quantity surveyor",
+
+    # Sales-heavy (optional)
+    "sales engineer",
+    "business development",
+]
+
+SPONSORSHIP_RELEVANCE_HINTS = [
+    "visa sponsorship",
+    "sponsorship available",
+    "skilled worker visa",
+    "right to work uk",
+    "relocation support",
+]
+
+CORE_TITLES_HIGH_PRIORITY = [
+    "Mechatronics Engineer",
+    "Electromechanical Engineer",
+    "Automation Engineer",
+    "Industrial Automation Engineer",
+    "Controls Engineer",
+    "Robotics Integration Engineer",
+    "Product Development Engineer",
+    "NPI Engineer",
+    "Digital Manufacturing Engineer",
+    "Manufacturing Systems Engineer",
+    "Test and Validation Engineer",
+    "Manufacturing Process Engineer",
+]
 
 
+# ------------------------------
+# Basic helpers (existing bot)
+# ------------------------------
 def must_env(name: str) -> str:
     v = os.getenv(name)
     if not v:
         raise RuntimeError(f"Missing env var: {name}")
     return v
+
 
 def normalize_company(name: str) -> str:
     if not name:
@@ -66,6 +313,7 @@ def normalize_company(name: str) -> str:
     name = re.sub(r"\s+", " ", name).strip()
     return name
 
+
 def get_latest_sponsor_csv_url() -> str:
     html = requests.get(SPONSOR_PAGE, timeout=30).text
     soup = BeautifulSoup(html, "html.parser")
@@ -76,6 +324,7 @@ def get_latest_sponsor_csv_url() -> str:
     if not link:
         raise RuntimeError("Could not find sponsor CSV link on the GOV.UK sponsor register page.")
     return link["href"]
+
 
 def load_sponsors() -> pd.DataFrame:
     csv_url = get_latest_sponsor_csv_url()
@@ -99,7 +348,8 @@ def load_sponsors() -> pd.DataFrame:
     grouped = df.groupby(["org_name", "org_norm"], as_index=False)["route"].agg(lambda s: sorted(set(map(str, s))))
     return grouped
 
-def sponsor_match(employer: str, sponsors_df: pd.DataFrame) -> Optional[Dict]:
+
+def sponsor_match(employer: str, sponsors_df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     emp_norm = normalize_company(employer)
     if not emp_norm:
         return None
@@ -122,7 +372,8 @@ def sponsor_match(employer: str, sponsors_df: pd.DataFrame) -> Optional[Dict]:
 
     return None
 
-def fetch_adzuna_jobs(app_id: str, app_key: str, what: str, results_per_page: int = 50) -> List[Dict]:
+
+def fetch_adzuna_jobs(app_id: str, app_key: str, what: str, results_per_page: int = 50) -> List[Dict[str, Any]]:
     params = {
         "app_id": app_id,
         "app_key": app_key,
@@ -135,22 +386,27 @@ def fetch_adzuna_jobs(app_id: str, app_key: str, what: str, results_per_page: in
     data = r.json()
     return data.get("results", [])
 
+
 def init_db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
 
-    con.execute("""
+    con.execute(
+        """
         CREATE TABLE IF NOT EXISTS seen (
             job_key TEXT PRIMARY KEY,
             first_seen INTEGER
         )
-    """)
+        """
+    )
 
-    con.execute("""
+    con.execute(
+        """
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT
         )
-    """)
+        """
+    )
 
     con.commit()
     return con
@@ -160,9 +416,11 @@ def already_seen(con: sqlite3.Connection, job_key: str) -> bool:
     cur = con.execute("SELECT 1 FROM seen WHERE job_key = ?", (job_key,))
     return cur.fetchone() is not None
 
+
 def mark_seen(con: sqlite3.Connection, job_key: str) -> None:
     con.execute("INSERT OR IGNORE INTO seen(job_key, first_seen) VALUES (?, ?)", (job_key, int(time.time())))
     con.commit()
+
 
 def tg_send(bot_token: str, chat_id: str, text: str) -> None:
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -185,20 +443,19 @@ def tg_send(bot_token: str, chat_id: str, text: str) -> None:
             r.raise_for_status()
             return
 
-
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             # backoff + jitter
             sleep_s = min(30, 2 ** attempt) + random.random()
             time.sleep(sleep_s)
             continue
 
-    # If we get here, all retries failed
     raise RuntimeError("Failed to send Telegram message after multiple retries.")
 
-def get_target_chat_ids() -> list[str]:
-    ids: list[str] = []
 
-    # Primary target (your channel)
+def get_target_chat_ids() -> List[str]:
+    ids: List[str] = []
+
+    # Primary target (channel/group)
     main_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if main_id:
         ids.append(main_id)
@@ -213,7 +470,7 @@ def get_target_chat_ids() -> list[str]:
     return ids
 
 
-def tg_send_multi(bot_token: str, chat_ids: list[str], text: str) -> None:
+def tg_send_multi(bot_token: str, chat_ids: List[str], text: str) -> None:
     for cid in chat_ids:
         tg_send(bot_token, cid, text)
         time.sleep(1.1)  # avoid flooding / resets
@@ -221,7 +478,7 @@ def tg_send_multi(bot_token: str, chat_ids: list[str], text: str) -> None:
 
 def chunk_lines(lines: List[str], max_chars: int = 3800) -> List[str]:
     # Telegram hard limit is 4096 chars; keep buffer for safety
-    chunks = []
+    chunks: List[str] = []
     buf = ""
     for line in lines:
         if len(buf) + len(line) + 1 > max_chars:
@@ -234,18 +491,245 @@ def chunk_lines(lines: List[str], max_chars: int = 3800) -> List[str]:
         chunks.append(buf.strip())
     return chunks
 
-def main():
+
+# ------------------------------
+# Relevance scoring helpers (NEW)
+# ------------------------------
+@dataclass
+class MatchConfig:
+    # Matching thresholds
+    fuzzy_title_threshold: float = 0.86
+    min_description_hits_for_non_exact_title: int = 2
+    min_score_to_alert: int = 28
+
+    # Scoring weights
+    score_exact_title: int = 40
+    score_fuzzy_title: int = 30
+    score_high_priority_title: int = 12
+    score_title_keyword_hit: int = 8
+    score_description_keyword_hit: int = 3
+    score_sponsorship_hint_hit: int = 2
+    score_bonus_skill_hit: int = 2
+
+    # Caps (prevents noisy descriptions from over-scoring)
+    cap_title_keyword_hits: int = 3
+    cap_description_keyword_hits: int = 6
+    cap_sponsorship_hint_hits: int = 2
+    cap_bonus_skill_hits: int = 4
+
+    bonus_skill_keywords: List[str] = field(default_factory=lambda: [
+        "python", "matlab", "plc", "scada", "controls", "automation",
+        "mechatronics", "electromechanical", "digital manufacturing", "industry 4.0",
+    ])
+
+
+def normalize_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    t = text.lower()
+    t = t.replace("&", " and ")
+    t = t.replace("/", " ")
+    t = t.replace("-", " ")
+    t = re.sub(r"[^a-z0-9+.#\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def contains_phrase(text_norm: str, phrase_norm: str) -> bool:
+    return phrase_norm in text_norm
+
+
+def keyword_hits(text_norm: str, keywords: Iterable[str]) -> List[str]:
+    hits: List[str] = []
+    for kw in keywords:
+        k = normalize_text(kw)
+        if not k:
+            continue
+        if contains_phrase(text_norm, k):
+            hits.append(kw)
+    return hits
+
+
+def best_fuzzy_title_match(title_norm: str, target_titles: Iterable[str]) -> tuple[float, Optional[str]]:
+    best_score = 0.0
+    best_title: Optional[str] = None
+    for t in target_titles:
+        t_norm = normalize_text(t)
+        if not t_norm:
+            continue
+        score = SequenceMatcher(None, title_norm, t_norm).ratio()
+        if score > best_score:
+            best_score = score
+            best_title = t
+    return best_score, best_title
+
+
+def company_in_sponsor_list(company_name: str, sponsor_companies_norm: Optional[Set[str]]) -> bool:
+    if sponsor_companies_norm is None:
+        return True  # sponsor check skipped externally
+    return normalize_text(company_name) in sponsor_companies_norm
+
+
+def score_job_posting(
+    job: Dict[str, Any],
+    *,
+    target_job_titles: List[str],
+    title_keywords: List[str],
+    description_include_keywords: List[str],
+    exclude_keywords: List[str],
+    sponsorship_relevance_hints: Optional[List[str]] = None,
+    core_titles_high_priority: Optional[List[str]] = None,
+    sponsor_companies_norm: Optional[Set[str]] = None,
+    config: Optional[MatchConfig] = None,
+) -> Dict[str, Any]:
+    cfg = config or MatchConfig()
+    sponsorship_relevance_hints = sponsorship_relevance_hints or []
+    core_titles_high_priority = core_titles_high_priority or []
+
+    title = str(job.get("title", "") or "")
+    desc = str(job.get("description", "") or "")
+    company = str(job.get("company", "") or "")
+
+    title_norm = normalize_text(title)
+    desc_norm = normalize_text(desc)
+    company_norm = normalize_text(company)
+    combined_norm = f"{title_norm} {desc_norm}".strip()
+
+    debug_reasons: List[str] = []
+    score = 0
+
+    # Optional sponsor gate (not used in main because sponsor_match() already runs first)
+    sponsor_ok = company_in_sponsor_list(company, sponsor_companies_norm)
+    if not sponsor_ok:
+        return {
+            "accepted": False,
+            "score": 0,
+            "reject_reason": "company_not_in_sponsor_list",
+            "debug": {
+                "company": company,
+                "company_norm": company_norm,
+                "reasons": ["Company did not match sponsor list"],
+            },
+        }
+    debug_reasons.append("company matched sponsor list" if sponsor_companies_norm else "sponsor check skipped")
+
+    # Exclude filter
+    exclude_hits = keyword_hits(combined_norm, exclude_keywords)
+    if exclude_hits:
+        return {
+            "accepted": False,
+            "score": 0,
+            "reject_reason": "exclude_keyword",
+            "debug": {
+                "title": title,
+                "company": company,
+                "exclude_hits": exclude_hits,
+                "reasons": [f"Excluded by keywords: {exclude_hits}"],
+            },
+        }
+
+    # Exact title match
+    target_titles_norm = {normalize_text(t): t for t in target_job_titles}
+    exact_title_match = title_norm in target_titles_norm
+    if exact_title_match:
+        score += cfg.score_exact_title
+        debug_reasons.append(f"exact title match: {target_titles_norm[title_norm]}")
+
+    # Fuzzy title match (near-exact)
+    fuzzy_score, fuzzy_title = best_fuzzy_title_match(title_norm, target_job_titles)
+    fuzzy_title_match = (fuzzy_score >= cfg.fuzzy_title_threshold) and not exact_title_match
+    if fuzzy_title_match:
+        score += cfg.score_fuzzy_title
+        debug_reasons.append(f"fuzzy title match: {fuzzy_title} ({fuzzy_score:.2f})")
+
+    # High-priority title boost
+    core_titles_norm = {normalize_text(t) for t in core_titles_high_priority}
+    if title_norm in core_titles_norm:
+        score += cfg.score_high_priority_title
+        debug_reasons.append("high-priority title boost")
+
+    # Title keyword hits
+    title_kw_hits = list(dict.fromkeys(keyword_hits(title_norm, title_keywords)))
+    title_kw_count_used = min(len(title_kw_hits), cfg.cap_title_keyword_hits)
+    if title_kw_count_used:
+        score += title_kw_count_used * cfg.score_title_keyword_hit
+        debug_reasons.append(f"title keyword hits: {title_kw_hits[:cfg.cap_title_keyword_hits]}")
+
+    # Description keyword hits
+    desc_kw_hits = list(dict.fromkeys(keyword_hits(desc_norm, description_include_keywords)))
+    desc_kw_count_used = min(len(desc_kw_hits), cfg.cap_description_keyword_hits)
+    if desc_kw_count_used:
+        score += desc_kw_count_used * cfg.score_description_keyword_hit
+        debug_reasons.append(f"description keyword hits: {desc_kw_hits[:cfg.cap_description_keyword_hits]}")
+
+    # Sponsorship hints (optional bonus only)
+    sponsor_hint_hits = list(dict.fromkeys(keyword_hits(desc_norm, sponsorship_relevance_hints)))
+    sponsor_hint_count_used = min(len(sponsor_hint_hits), cfg.cap_sponsorship_hint_hits)
+    if sponsor_hint_count_used:
+        score += sponsor_hint_count_used * cfg.score_sponsorship_hint_hit
+        debug_reasons.append(f"sponsorship hints: {sponsor_hint_hits[:cfg.cap_sponsorship_hint_hits]}")
+
+    # Bonus skill terms
+    bonus_skill_hits = list(dict.fromkeys(keyword_hits(combined_norm, cfg.bonus_skill_keywords)))
+    bonus_skill_count_used = min(len(bonus_skill_hits), cfg.cap_bonus_skill_hits)
+    if bonus_skill_count_used:
+        score += bonus_skill_count_used * cfg.score_bonus_skill_hit
+        debug_reasons.append(f"bonus skill hits: {bonus_skill_hits[:cfg.cap_bonus_skill_hits]}")
+
+    title_relevant = exact_title_match or fuzzy_title_match or (len(title_kw_hits) >= 1)
+    desc_relevant = len(desc_kw_hits) >= cfg.min_description_hits_for_non_exact_title
+    if exact_title_match or fuzzy_title_match:
+        desc_relevant = True
+
+    accepted = bool(title_relevant and desc_relevant and score >= cfg.min_score_to_alert)
+
+    reject_reason = None
+    if not accepted:
+        if not title_relevant:
+            reject_reason = "title_not_relevant"
+        elif not desc_relevant:
+            reject_reason = "description_not_relevant_enough"
+        else:
+            reject_reason = "score_below_threshold"
+
+    return {
+        "accepted": accepted,
+        "score": score,
+        "reject_reason": reject_reason,
+        "debug": {
+            "company": company,
+            "title": title,
+            "title_norm": title_norm,
+            "exact_title_match": exact_title_match,
+            "fuzzy_title_match": fuzzy_title_match,
+            "fuzzy_title_best": fuzzy_title,
+            "fuzzy_title_score": round(fuzzy_score, 3),
+            "title_keyword_hits": title_kw_hits,
+            "description_keyword_hits": desc_kw_hits,
+            "sponsorship_hint_hits": sponsor_hint_hits,
+            "bonus_skill_hits": bonus_skill_hits,
+            "reasons": debug_reasons,
+        },
+    }
+
+
+def main() -> None:
     bot_token = must_env("TELEGRAM_BOT_TOKEN")
     chat_ids = get_target_chat_ids()
     adzuna_id = must_env("ADZUNA_APP_ID")
     adzuna_key = must_env("ADZUNA_APP_KEY")
 
-
     sponsors = load_sponsors()
     con = init_db()
 
-
     new_lines: List[str] = []
+
+    # Optional: tune scoring centrally here
+    match_cfg = MatchConfig(
+        fuzzy_title_threshold=0.86,
+        min_description_hits_for_non_exact_title=2,
+        min_score_to_alert=28,
+    )
 
     for q in QUERIES:
         jobs = fetch_adzuna_jobs(adzuna_id, adzuna_key, what=q, results_per_page=MAX_JOBS_PER_QUERY)
@@ -254,44 +738,66 @@ def main():
             company = ((j.get("company") or {}).get("display_name") or "").strip()
             location = ((j.get("location") or {}).get("display_name") or "").strip()
             link = (j.get("redirect_url") or "").strip()
+            description = (j.get("description") or "").strip()
 
             if not title or not company or not link:
                 continue
 
             # build a stable key (use Adzuna id if present, else link)
             job_key = str(j.get("id") or link)
-
             if already_seen(con, job_key):
                 continue
 
-            # sponsor filter
-            m = sponsor_match(company, sponsors)
-            if not m:
+            # Sponsor filter first
+            sponsor_info = sponsor_match(company, sponsors)
+            if not sponsor_info:
                 continue
 
-            # ✅ required output format (single line)
+            # Relevance scoring (NEW)
+            job_for_score = {
+                "title": title,
+                "company": company,
+                "description": description,
+                "location": location,
+                "url": link,
+            }
+
+            score_result = score_job_posting(
+                job_for_score,
+                target_job_titles=TARGET_JOB_TITLES,
+                title_keywords=TITLE_KEYWORDS,
+                description_include_keywords=DESCRIPTION_INCLUDE_KEYWORDS,
+                exclude_keywords=EXCLUDE_KEYWORDS,
+                sponsorship_relevance_hints=SPONSORSHIP_RELEVANCE_HINTS,
+                core_titles_high_priority=CORE_TITLES_HIGH_PRIORITY,
+                sponsor_companies_norm=None,  # sponsor check already done above
+                config=match_cfg,
+            )
+
+            if not score_result["accepted"]:
+                continue
+
+            # Required output format (single line)
+            # If you want score in admin/debug, append: f" [{score_result['score']}]"
             line = f"{title} | {company} | {location} | {link}"
             new_lines.append(line)
 
             mark_seen(con, job_key)
 
     if not new_lines:
-        tg_send_multi(bot_token, chat_ids, "No new sponsor-licensed mechanical jobs found today.")
+        tg_send_multi(bot_token, chat_ids, "No new sponsor-licensed engineering jobs found today.")
         return
 
-    # Optional: sort for nicer digests
+    # Optional: sort + de-duplicate for nicer digests
     new_lines = sorted(set(new_lines), key=lambda s: s.lower())
 
-    header = "Today’s new sponsor-licensed mechanical jobs:\n"
+    header = "Today’s new sponsor-licensed engineering jobs:\n"
     chunks = chunk_lines([header] + new_lines)
 
-    for i, msg in enumerate(chunks):
+    for msg in chunks:
         tg_send_multi(bot_token, chat_ids, msg)
-    time.sleep(1.1)  # keep under 1 msg/sec for the same chat
+    time.sleep(1.1)  # keep under 1 msg/sec for same chat
 
 
 if __name__ == "__main__":
     main()
-
-
-
