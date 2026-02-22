@@ -20,7 +20,7 @@ import sqlite3
 import random
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import Optional, Dict, List, Iterable, Set, Any
+from typing import Optional, Dict, List, Iterable, Set, Any, Tuple
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -30,9 +30,11 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from rapidfuzz import process, fuzz
 
+
 SPONSOR_PAGE = "https://www.gov.uk/government/publications/register-of-licensed-sponsors-workers"
-ADZUNA_ENDPOINT = "https://api.adzuna.com/v1/api/jobs/gb/search/1"
+ADZUNA_ENDPOINT_TEMPLATE = "https://api.adzuna.com/v1/api/jobs/gb/search/{page}"
 DB_PATH = os.path.join(os.path.dirname(__file__), "seen_jobs.sqlite3")
+
 
 # ---------------------------------
 # Search queries (tune anytime)
@@ -60,9 +62,14 @@ QUERIES = [
     "commissioning engineer automation",
 ]
 
+# Adzuna search tuning
+ADZUNA_PAGES_PER_QUERY = 3
+MAX_JOBS_PER_QUERY = 50
+ADZUNA_MAX_DAYS_OLD = 14  # keep digest reasonably fresh
+
 # Sponsor name fuzzy threshold (rapidfuzz token_sort_ratio out of 100)
 FUZZY_THRESHOLD = 92
-MAX_JOBS_PER_QUERY = 50
+
 
 # ---------------------------------
 # Relevance / scoring config lists
@@ -294,7 +301,7 @@ CORE_TITLES_HIGH_PRIORITY = [
 
 
 # ------------------------------
-# Basic helpers (existing bot)
+# Basic helpers
 # ------------------------------
 def must_env(name: str) -> str:
     v = os.getenv(name)
@@ -314,12 +321,23 @@ def normalize_company(name: str) -> str:
     return name
 
 
+def normalize_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    t = text.lower()
+    t = t.replace("&", " and ")
+    t = t.replace("/", " ")
+    t = t.replace("-", " ")
+    t = re.sub(r"[^a-z0-9+.#\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def get_latest_sponsor_csv_url() -> str:
     html = requests.get(SPONSOR_PAGE, timeout=30).text
     soup = BeautifulSoup(html, "html.parser")
     link = soup.select_one('a[href*="assets.publishing.service.gov.uk"][href$=".csv"]')
     if not link:
-        # fallback: sometimes the GOV.UK page structure changes; try any .csv link
         link = soup.select_one('a[href$=".csv"]')
     if not link:
         raise RuntimeError("Could not find sponsor CSV link on the GOV.UK sponsor register page.")
@@ -330,7 +348,6 @@ def load_sponsors() -> pd.DataFrame:
     csv_url = get_latest_sponsor_csv_url()
     df = pd.read_csv(csv_url)
 
-    # Defensive column mapping (GOV.UK sometimes changes headers slightly)
     cols = {c.strip().lower(): c for c in df.columns}
     org_col = cols.get("organisation name") or cols.get("organization name")
     route_col = cols.get("route")
@@ -338,7 +355,6 @@ def load_sponsors() -> pd.DataFrame:
     if not org_col:
         raise RuntimeError(f"Unexpected sponsor CSV columns (no org name found): {df.columns.tolist()}")
     if not route_col:
-        # routes are helpful but not mandatory for matching; create placeholder if missing
         df["route"] = ""
         route_col = "route"
 
@@ -354,14 +370,12 @@ def sponsor_match(employer: str, sponsors_df: pd.DataFrame) -> Optional[Dict[str
     if not emp_norm:
         return None
 
-    # exact normalized match
     exact = sponsors_df[sponsors_df["org_norm"] == emp_norm]
     if len(exact) > 0:
         row = exact.iloc[0].to_dict()
         row["match_type"] = "exact"
         return row
 
-    # fuzzy fallback
     choices = sponsors_df["org_norm"].tolist()
     best = process.extractOne(emp_norm, choices, scorer=fuzz.token_sort_ratio)
     if best and best[1] >= FUZZY_THRESHOLD:
@@ -373,7 +387,16 @@ def sponsor_match(employer: str, sponsors_df: pd.DataFrame) -> Optional[Dict[str
     return None
 
 
-def fetch_adzuna_jobs(app_id: str, app_key: str, what: str, results_per_page: int = 50) -> List[Dict[str, Any]]:
+def fetch_adzuna_jobs(
+    app_id: str,
+    app_key: str,
+    what: str,
+    *,
+    page: int = 1,
+    results_per_page: int = 50,
+    max_days_old: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    endpoint = ADZUNA_ENDPOINT_TEMPLATE.format(page=page)
     params = {
         "app_id": app_id,
         "app_key": app_key,
@@ -381,7 +404,10 @@ def fetch_adzuna_jobs(app_id: str, app_key: str, what: str, results_per_page: in
         "what": what,
         "content-type": "application/json",
     }
-    r = requests.get(ADZUNA_ENDPOINT, params=params, timeout=30)
+    if max_days_old is not None:
+        params["max_days_old"] = max_days_old
+
+    r = requests.get(endpoint, params=params, timeout=30)
     r.raise_for_status()
     data = r.json()
     return data.get("results", [])
@@ -426,11 +452,10 @@ def tg_send(bot_token: str, chat_id: str, text: str) -> None:
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
 
-    for attempt in range(1, 6):  # up to 5 tries
+    for attempt in range(1, 6):
         try:
             r = requests.post(url, json=payload, timeout=30)
 
-            # Handle Telegram rate limits (429 with retry_after)
             if r.status_code == 429:
                 try:
                     data = r.json()
@@ -444,7 +469,6 @@ def tg_send(bot_token: str, chat_id: str, text: str) -> None:
             return
 
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-            # backoff + jitter
             sleep_s = min(30, 2 ** attempt) + random.random()
             time.sleep(sleep_s)
             continue
@@ -455,12 +479,10 @@ def tg_send(bot_token: str, chat_id: str, text: str) -> None:
 def get_target_chat_ids() -> List[str]:
     ids: List[str] = []
 
-    # Primary target (channel/group)
     main_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if main_id:
         ids.append(main_id)
 
-    # Optional admin DM
     admin_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "").strip()
     if admin_id and admin_id not in ids:
         ids.append(admin_id)
@@ -477,7 +499,6 @@ def tg_send_multi(bot_token: str, chat_ids: List[str], text: str) -> None:
 
 
 def chunk_lines(lines: List[str], max_chars: int = 3800) -> List[str]:
-    # Telegram hard limit is 4096 chars; keep buffer for safety
     chunks: List[str] = []
     buf = ""
     for line in lines:
@@ -493,16 +514,135 @@ def chunk_lines(lines: List[str], max_chars: int = 3800) -> List[str]:
 
 
 # ------------------------------
-# Relevance scoring helpers (NEW)
+# UK / job-title filters (NEW)
+# ------------------------------
+def is_mech_related_title(title: str) -> bool:
+    t = (title or "").lower()
+
+    include_keywords = [
+        "mechanical",
+        "mechatronics",
+        "electromechanical",
+        "electro-mechanical",
+        "automation engineer",
+        "industrial automation",
+        "controls engineer",
+        "control systems engineer",
+        "plc engineer",
+        "robotics engineer",
+        "robotics integration",
+        "commissioning engineer",
+        "manufacturing engineer",
+        "manufacturing process engineer",
+        "process engineer",
+        "production engineer",
+        "npi engineer",
+        "product development engineer",
+        "validation engineer",
+        "test engineer",
+        "reliability engineer",
+        "simulation engineer",
+        "cae engineer",
+        "design engineer",
+        "design and development engineer",
+        "field service engineer",
+        "applications engineer",
+    ]
+
+    exclude_keywords = [
+        "sales",
+        "inside sales",
+        "business development",
+        "account manager",
+        "recruiter",
+        "talent acquisition",
+        "customer service",
+        "marketing",
+        "finance",
+        "hr ",
+        "human resources",
+        "teacher",
+        "nurse",
+    ]
+
+    return any(k in t for k in include_keywords) and not any(k in t for k in exclude_keywords)
+
+
+def is_uk_job(title: str, company: str, location: str, description: str = "") -> bool:
+    text = f"{title} {company} {location} {description}".lower()
+
+    uk_signals = [
+        "united kingdom",
+        " uk ",
+        "uk-based",
+        "england",
+        "scotland",
+        "wales",
+        "northern ireland",
+        "london",
+        "manchester",
+        "birmingham",
+        "bristol",
+        "leeds",
+        "glasgow",
+        "edinburgh",
+        "liverpool",
+        "sheffield",
+        "nottingham",
+        "newcastle",
+        "southampton",
+        "coventry",
+        "milton keynes",
+        "cambridge",
+        "oxford",
+        "remote uk",
+        "uk remote",
+    ]
+
+    non_uk_signals = [
+        "united states",
+        " usa",
+        " us ",
+        "new york",
+        "california",
+        "texas",
+        "seattle",
+        "austin",
+        "boston",
+        "chicago",
+        "toronto",
+        "canada",
+        "australia",
+        "singapore",
+    ]
+
+    loc = (location or "").lower()
+
+    # Strong location-field UK signals
+    if any(x in loc for x in ["united kingdom", " uk", ", uk", "england", "scotland", "wales", "northern ireland"]):
+        return True
+
+    has_uk = any(x in f" {text} " for x in uk_signals)
+    has_non_uk = any(x in f" {text} " for x in non_uk_signals)
+
+    if has_uk and not has_non_uk:
+        return True
+    if has_non_uk and not has_uk:
+        return False
+
+    # Adzuna GB endpoint is already UK-biased, so if unknown we allow and let scoring filter handle the rest
+    return True
+
+
+# ------------------------------
+# Relevance scoring helpers
 # ------------------------------
 @dataclass
 class MatchConfig:
-    # Matching thresholds
     fuzzy_title_threshold: float = 0.86
     min_description_hits_for_non_exact_title: int = 2
     min_score_to_alert: int = 28
 
-    # Scoring weights
     score_exact_title: int = 40
     score_fuzzy_title: int = 30
     score_high_priority_title: int = 12
@@ -511,7 +651,6 @@ class MatchConfig:
     score_sponsorship_hint_hit: int = 2
     score_bonus_skill_hit: int = 2
 
-    # Caps (prevents noisy descriptions from over-scoring)
     cap_title_keyword_hits: int = 3
     cap_description_keyword_hits: int = 6
     cap_sponsorship_hint_hits: int = 2
@@ -521,18 +660,6 @@ class MatchConfig:
         "python", "matlab", "plc", "scada", "controls", "automation",
         "mechatronics", "electromechanical", "digital manufacturing", "industry 4.0",
     ])
-
-
-def normalize_text(text: Optional[str]) -> str:
-    if not text:
-        return ""
-    t = text.lower()
-    t = t.replace("&", " and ")
-    t = t.replace("/", " ")
-    t = t.replace("-", " ")
-    t = re.sub(r"[^a-z0-9+.#\s]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
 
 
 def contains_phrase(text_norm: str, phrase_norm: str) -> bool:
@@ -550,7 +677,7 @@ def keyword_hits(text_norm: str, keywords: Iterable[str]) -> List[str]:
     return hits
 
 
-def best_fuzzy_title_match(title_norm: str, target_titles: Iterable[str]) -> tuple[float, Optional[str]]:
+def best_fuzzy_title_match(title_norm: str, target_titles: Iterable[str]) -> Tuple[float, Optional[str]]:
     best_score = 0.0
     best_title: Optional[str] = None
     for t in target_titles:
@@ -566,7 +693,7 @@ def best_fuzzy_title_match(title_norm: str, target_titles: Iterable[str]) -> tup
 
 def company_in_sponsor_list(company_name: str, sponsor_companies_norm: Optional[Set[str]]) -> bool:
     if sponsor_companies_norm is None:
-        return True  # sponsor check skipped externally
+        return True
     return normalize_text(company_name) in sponsor_companies_norm
 
 
@@ -598,7 +725,6 @@ def score_job_posting(
     debug_reasons: List[str] = []
     score = 0
 
-    # Optional sponsor gate (not used in main because sponsor_match() already runs first)
     sponsor_ok = company_in_sponsor_list(company, sponsor_companies_norm)
     if not sponsor_ok:
         return {
@@ -613,7 +739,6 @@ def score_job_posting(
         }
     debug_reasons.append("company matched sponsor list" if sponsor_companies_norm else "sponsor check skipped")
 
-    # Exclude filter
     exclude_hits = keyword_hits(combined_norm, exclude_keywords)
     if exclude_hits:
         return {
@@ -628,48 +753,41 @@ def score_job_posting(
             },
         }
 
-    # Exact title match
     target_titles_norm = {normalize_text(t): t for t in target_job_titles}
     exact_title_match = title_norm in target_titles_norm
     if exact_title_match:
         score += cfg.score_exact_title
         debug_reasons.append(f"exact title match: {target_titles_norm[title_norm]}")
 
-    # Fuzzy title match (near-exact)
     fuzzy_score, fuzzy_title = best_fuzzy_title_match(title_norm, target_job_titles)
     fuzzy_title_match = (fuzzy_score >= cfg.fuzzy_title_threshold) and not exact_title_match
     if fuzzy_title_match:
         score += cfg.score_fuzzy_title
         debug_reasons.append(f"fuzzy title match: {fuzzy_title} ({fuzzy_score:.2f})")
 
-    # High-priority title boost
     core_titles_norm = {normalize_text(t) for t in core_titles_high_priority}
     if title_norm in core_titles_norm:
         score += cfg.score_high_priority_title
         debug_reasons.append("high-priority title boost")
 
-    # Title keyword hits
     title_kw_hits = list(dict.fromkeys(keyword_hits(title_norm, title_keywords)))
     title_kw_count_used = min(len(title_kw_hits), cfg.cap_title_keyword_hits)
     if title_kw_count_used:
         score += title_kw_count_used * cfg.score_title_keyword_hit
         debug_reasons.append(f"title keyword hits: {title_kw_hits[:cfg.cap_title_keyword_hits]}")
 
-    # Description keyword hits
     desc_kw_hits = list(dict.fromkeys(keyword_hits(desc_norm, description_include_keywords)))
     desc_kw_count_used = min(len(desc_kw_hits), cfg.cap_description_keyword_hits)
     if desc_kw_count_used:
         score += desc_kw_count_used * cfg.score_description_keyword_hit
         debug_reasons.append(f"description keyword hits: {desc_kw_hits[:cfg.cap_description_keyword_hits]}")
 
-    # Sponsorship hints (optional bonus only)
     sponsor_hint_hits = list(dict.fromkeys(keyword_hits(desc_norm, sponsorship_relevance_hints)))
     sponsor_hint_count_used = min(len(sponsor_hint_hits), cfg.cap_sponsorship_hint_hits)
     if sponsor_hint_count_used:
         score += sponsor_hint_count_used * cfg.score_sponsorship_hint_hit
         debug_reasons.append(f"sponsorship hints: {sponsor_hint_hits[:cfg.cap_sponsorship_hint_hits]}")
 
-    # Bonus skill terms
     bonus_skill_hits = list(dict.fromkeys(keyword_hits(combined_norm, cfg.bonus_skill_keywords)))
     bonus_skill_count_used = min(len(bonus_skill_hits), cfg.cap_bonus_skill_hits)
     if bonus_skill_count_used:
@@ -724,7 +842,6 @@ def main() -> None:
 
     new_lines: List[str] = []
 
-    # Optional: tune scoring centrally here
     match_cfg = MatchConfig(
         fuzzy_title_threshold=0.86,
         min_description_hits_for_non_exact_title=2,
@@ -732,63 +849,76 @@ def main() -> None:
     )
 
     for q in QUERIES:
-        jobs = fetch_adzuna_jobs(adzuna_id, adzuna_key, what=q, results_per_page=MAX_JOBS_PER_QUERY)
-        for j in jobs:
-            title = (j.get("title") or "").strip()
-            company = ((j.get("company") or {}).get("display_name") or "").strip()
-            location = ((j.get("location") or {}).get("display_name") or "").strip()
-            link = (j.get("redirect_url") or "").strip()
-            description = (j.get("description") or "").strip()
-
-            if not title or not company or not link:
-                continue
-
-            # build a stable key (use Adzuna id if present, else link)
-            job_key = str(j.get("id") or link)
-            if already_seen(con, job_key):
-                continue
-
-            # Sponsor filter first
-            sponsor_info = sponsor_match(company, sponsors)
-            if not sponsor_info:
-                continue
-
-            # Relevance scoring (NEW)
-            job_for_score = {
-                "title": title,
-                "company": company,
-                "description": description,
-                "location": location,
-                "url": link,
-            }
-
-            score_result = score_job_posting(
-                job_for_score,
-                target_job_titles=TARGET_JOB_TITLES,
-                title_keywords=TITLE_KEYWORDS,
-                description_include_keywords=DESCRIPTION_INCLUDE_KEYWORDS,
-                exclude_keywords=EXCLUDE_KEYWORDS,
-                sponsorship_relevance_hints=SPONSORSHIP_RELEVANCE_HINTS,
-                core_titles_high_priority=CORE_TITLES_HIGH_PRIORITY,
-                sponsor_companies_norm=None,  # sponsor check already done above
-                config=match_cfg,
+        for page in range(1, ADZUNA_PAGES_PER_QUERY + 1):
+            jobs = fetch_adzuna_jobs(
+                adzuna_id,
+                adzuna_key,
+                what=q,
+                page=page,
+                results_per_page=MAX_JOBS_PER_QUERY,
+                max_days_old=ADZUNA_MAX_DAYS_OLD,
             )
 
-            if not score_result["accepted"]:
-                continue
+            if not jobs:
+                break  # no more pages for this query
 
-            # Required output format (single line)
-            # If you want score in admin/debug, append: f" [{score_result['score']}]"
-            line = f"{title} | {company} | {location} | {link}"
-            new_lines.append(line)
+            for j in jobs:
+                title = (j.get("title") or "").strip()
+                company = ((j.get("company") or {}).get("display_name") or "").strip()
+                location = ((j.get("location") or {}).get("display_name") or "").strip()
+                link = (j.get("redirect_url") or "").strip()
+                description = (j.get("description") or "").strip()
 
-            mark_seen(con, job_key)
+                if not title or not company or not link:
+                    continue
+
+                # Filter obvious noise early
+                if not is_mech_related_title(title):
+                    continue
+
+                # Keep UK-focused results
+                if not is_uk_job(title, company, location, description):
+                    continue
+
+                job_key = str(j.get("id") or link)
+                if already_seen(con, job_key):
+                    continue
+
+                sponsor_info = sponsor_match(company, sponsors)
+                if not sponsor_info:
+                    continue
+
+                job_for_score = {
+                    "title": title,
+                    "company": company,
+                    "description": description,
+                    "location": location,
+                    "url": link,
+                }
+
+                score_result = score_job_posting(
+                    job_for_score,
+                    target_job_titles=TARGET_JOB_TITLES,
+                    title_keywords=TITLE_KEYWORDS,
+                    description_include_keywords=DESCRIPTION_INCLUDE_KEYWORDS,
+                    exclude_keywords=EXCLUDE_KEYWORDS,
+                    sponsorship_relevance_hints=SPONSORSHIP_RELEVANCE_HINTS,
+                    core_titles_high_priority=CORE_TITLES_HIGH_PRIORITY,
+                    sponsor_companies_norm=None,
+                    config=match_cfg,
+                )
+
+                if not score_result["accepted"]:
+                    continue
+
+                line = f"{title} | {company} | {location} | {link}"
+                new_lines.append(line)
+                mark_seen(con, job_key)
 
     if not new_lines:
         tg_send_multi(bot_token, chat_ids, "No new sponsor-licensed engineering jobs found today.")
         return
 
-    # Optional: sort + de-duplicate for nicer digests
     new_lines = sorted(set(new_lines), key=lambda s: s.lower())
 
     header = "Today’s new sponsor-licensed engineering jobs:\n"
@@ -796,7 +926,6 @@ def main() -> None:
 
     for msg in chunks:
         tg_send_multi(bot_token, chat_ids, msg)
-    time.sleep(1.1)  # keep under 1 msg/sec for same chat
 
 
 if __name__ == "__main__":
