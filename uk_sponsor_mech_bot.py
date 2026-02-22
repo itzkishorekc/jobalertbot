@@ -927,6 +927,12 @@ def main() -> None:
     for msg in chunks:
         tg_send_multi(bot_token, chat_ids, msg)
 
+def send_admin_debug(bot_token: str, text: str) -> None:
+    admin_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "").strip()
+    if not admin_id:
+        return
+    tg_send(bot_token, admin_id, text)
 
 if __name__ == "__main__":
     main()
+
