@@ -6,11 +6,12 @@ Requirements:
   pip install requests beautifulsoup4 pandas rapidfuzz python-dotenv
 
 Env vars:
-  TELEGRAM_BOT_TOKEN = api telegram
-  TELEGRAM_CHAT_ID = id telegram (channel/group)
-  TELEGRAM_ADMIN_CHAT_ID = optional admin DM id
-  ADZUNA_APP_ID = id
-  ADZUNA_APP_KEY = key
+  TELEGRAM_BOT_TOKEN = Telegram bot token
+  TELEGRAM_CHAT_ID = main target chat id (channel/group)
+  TELEGRAM_ADMIN_CHAT_ID = optional admin DM chat id (for debug summary)
+  ADZUNA_APP_ID = Adzuna app id
+  ADZUNA_APP_KEY = Adzuna app key
+  DEBUG_SEND_SUMMARY = optional (1/0), default 1
 """
 
 import os
@@ -34,7 +35,6 @@ from rapidfuzz import process, fuzz
 SPONSOR_PAGE = "https://www.gov.uk/government/publications/register-of-licensed-sponsors-workers"
 ADZUNA_ENDPOINT_TEMPLATE = "https://api.adzuna.com/v1/api/jobs/gb/search/{page}"
 DB_PATH = os.path.join(os.path.dirname(__file__), "seen_jobs.sqlite3")
-
 
 # ---------------------------------
 # Search queries (tune anytime)
@@ -69,7 +69,6 @@ ADZUNA_MAX_DAYS_OLD = 14  # keep digest reasonably fresh
 
 # Sponsor name fuzzy threshold (rapidfuzz token_sort_ratio out of 100)
 FUZZY_THRESHOLD = 92
-
 
 # ---------------------------------
 # Relevance / scoring config lists
@@ -310,6 +309,22 @@ def must_env(name: str) -> str:
     return v
 
 
+def env_flag(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def inc(stats: Dict[str, Any], key: str, amount: int = 1) -> None:
+    stats[key] = int(stats.get(key, 0)) + amount
+
+
+def add_reason_count(stats: Dict[str, Any], reason: str) -> None:
+    reason_counts = stats.setdefault("score_reject_reasons", {})
+    reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+
+
 def normalize_company(name: str) -> str:
     if not name:
         return ""
@@ -492,10 +507,21 @@ def get_target_chat_ids() -> List[str]:
     return ids
 
 
+def get_admin_chat_id() -> str:
+    return os.getenv("TELEGRAM_ADMIN_CHAT_ID", "").strip()
+
+
 def tg_send_multi(bot_token: str, chat_ids: List[str], text: str) -> None:
     for cid in chat_ids:
         tg_send(bot_token, cid, text)
         time.sleep(1.1)  # avoid flooding / resets
+
+
+def send_admin_debug(bot_token: str, text: str) -> None:
+    admin_id = get_admin_chat_id()
+    if not admin_id:
+        return
+    tg_send(bot_token, admin_id, text)
 
 
 def chunk_lines(lines: List[str], max_chars: int = 3800) -> List[str]:
@@ -514,7 +540,7 @@ def chunk_lines(lines: List[str], max_chars: int = 3800) -> List[str]:
 
 
 # ------------------------------
-# UK / job-title filters (NEW)
+# UK / job-title filters
 # ------------------------------
 def is_mech_related_title(title: str) -> bool:
     t = (title or "").lower()
@@ -559,7 +585,7 @@ def is_mech_related_title(title: str) -> bool:
         "customer service",
         "marketing",
         "finance",
-        "hr ",
+        " hr ",
         "human resources",
         "teacher",
         "nurse",
@@ -570,67 +596,34 @@ def is_mech_related_title(title: str) -> bool:
 
 def is_uk_job(title: str, company: str, location: str, description: str = "") -> bool:
     text = f"{title} {company} {location} {description}".lower()
-
-    uk_signals = [
-        "united kingdom",
-        " uk ",
-        "uk-based",
-        "england",
-        "scotland",
-        "wales",
-        "northern ireland",
-        "london",
-        "manchester",
-        "birmingham",
-        "bristol",
-        "leeds",
-        "glasgow",
-        "edinburgh",
-        "liverpool",
-        "sheffield",
-        "nottingham",
-        "newcastle",
-        "southampton",
-        "coventry",
-        "milton keynes",
-        "cambridge",
-        "oxford",
-        "remote uk",
-        "uk remote",
-    ]
-
-    non_uk_signals = [
-        "united states",
-        " usa",
-        " us ",
-        "new york",
-        "california",
-        "texas",
-        "seattle",
-        "austin",
-        "boston",
-        "chicago",
-        "toronto",
-        "canada",
-        "australia",
-        "singapore",
-    ]
-
     loc = (location or "").lower()
 
     # Strong location-field UK signals
-    if any(x in loc for x in ["united kingdom", " uk", ", uk", "england", "scotland", "wales", "northern ireland"]):
+    strong_uk_loc_signals = ["united kingdom", "england", "scotland", "wales", "northern ireland", ", uk", " uk"]
+    if any(x in loc for x in strong_uk_loc_signals):
         return True
 
-    has_uk = any(x in f" {text} " for x in uk_signals)
-    has_non_uk = any(x in f" {text} " for x in non_uk_signals)
+    uk_signals = [
+        "london", "manchester", "birmingham", "bristol", "leeds", "glasgow", "edinburgh",
+        "liverpool", "sheffield", "nottingham", "newcastle", "southampton", "coventry",
+        "milton keynes", "cambridge", "oxford", "remote uk", "uk remote"
+    ]
+
+    non_uk_signals = [
+        "united states", " usa", " us ", "new york", "california", "texas", "seattle",
+        "austin", "boston", "chicago", "toronto", "canada", "australia", "singapore"
+    ]
+
+    padded = f" {text} "
+    has_uk = any(x in padded for x in uk_signals) or any(x in padded for x in [" united kingdom ", " uk "])
+    has_non_uk = any(x in padded for x in non_uk_signals)
 
     if has_uk and not has_non_uk:
         return True
     if has_non_uk and not has_uk:
         return False
 
-    # Adzuna GB endpoint is already UK-biased, so if unknown we allow and let scoring filter handle the rest
+    # Adzuna GB is UK-biased; allow unknowns to avoid false negatives
     return True
 
 
@@ -831,108 +824,207 @@ def score_job_posting(
     }
 
 
+# ------------------------------
+# Debug summary helpers
+# ------------------------------
+def build_debug_summary(stats: Dict[str, Any], status: str, error_text: str = "") -> str:
+    lines: List[str] = []
+    lines.append(f"🔎 Job bot debug summary ({status})")
+    lines.append(f"Queries: {stats.get('queries', 0)}")
+    lines.append(f"Pages checked: {stats.get('pages_checked', 0)}")
+    lines.append(f"Non-empty pages: {stats.get('pages_nonempty', 0)}")
+    lines.append(f"Jobs fetched total: {stats.get('jobs_fetched', 0)}")
+    lines.append(f"Skipped missing fields: {stats.get('skip_missing_fields', 0)}")
+    lines.append(f"Skipped title filter: {stats.get('skip_title_filter', 0)}")
+    lines.append(f"Skipped non-UK filter: {stats.get('skip_non_uk', 0)}")
+    lines.append(f"Skipped already seen: {stats.get('skip_seen', 0)}")
+    lines.append(f"Skipped sponsor mismatch: {stats.get('skip_sponsor', 0)}")
+    lines.append(f"Skipped score/relevance: {stats.get('skip_score', 0)}")
+    lines.append(f"Accepted before dedupe: {stats.get('accepted_before_dedupe', 0)}")
+    lines.append(f"Unique lines to send: {stats.get('unique_lines', 0)}")
+    lines.append(f"Digest chunks sent: {stats.get('digest_chunks', 0)}")
+    lines.append(f"Target chats used: {stats.get('chat_targets', 0)}")
+
+    reasons = stats.get("score_reject_reasons", {}) or {}
+    if reasons:
+        top = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        reason_text = ", ".join([f"{k}={v}" for k, v in top])
+        lines.append(f"Top score rejects: {reason_text}")
+
+    if stats.get("sample_sent"):
+        lines.append("Sample sent:")
+        for s in stats["sample_sent"][:3]:
+            lines.append(f"- {s}")
+
+    if error_text:
+        lines.append("Error:")
+        lines.append(error_text[:1500])
+
+    msg = "\n".join(lines)
+
+    # Keep debug summary within Telegram limits
+    if len(msg) > 3500:
+        msg = msg[:3450] + "\n...(truncated)"
+    return msg
+
+
+def maybe_send_debug_summary(bot_token: str, stats: Dict[str, Any], status: str, error_text: str = "") -> None:
+    if not get_admin_chat_id():
+        return
+    if not env_flag("DEBUG_SEND_SUMMARY", True):
+        return
+    msg = build_debug_summary(stats, status=status, error_text=error_text)
+    send_admin_debug(bot_token, msg)
+
+
 def main() -> None:
     bot_token = must_env("TELEGRAM_BOT_TOKEN")
     chat_ids = get_target_chat_ids()
     adzuna_id = must_env("ADZUNA_APP_ID")
     adzuna_key = must_env("ADZUNA_APP_KEY")
 
-    sponsors = load_sponsors()
-    con = init_db()
+    stats: Dict[str, Any] = {
+        "queries": 0,
+        "pages_checked": 0,
+        "pages_nonempty": 0,
+        "jobs_fetched": 0,
+        "skip_missing_fields": 0,
+        "skip_title_filter": 0,
+        "skip_non_uk": 0,
+        "skip_seen": 0,
+        "skip_sponsor": 0,
+        "skip_score": 0,
+        "accepted_before_dedupe": 0,
+        "unique_lines": 0,
+        "digest_chunks": 0,
+        "chat_targets": len(chat_ids),
+        "score_reject_reasons": {},
+        "sample_sent": [],
+    }
 
-    new_lines: List[str] = []
+    try:
+        sponsors = load_sponsors()
+        con = init_db()
 
-    match_cfg = MatchConfig(
-        fuzzy_title_threshold=0.86,
-        min_description_hits_for_non_exact_title=2,
-        min_score_to_alert=28,
-    )
+        new_lines: List[str] = []
 
-    for q in QUERIES:
-        for page in range(1, ADZUNA_PAGES_PER_QUERY + 1):
-            jobs = fetch_adzuna_jobs(
-                adzuna_id,
-                adzuna_key,
-                what=q,
-                page=page,
-                results_per_page=MAX_JOBS_PER_QUERY,
-                max_days_old=ADZUNA_MAX_DAYS_OLD,
-            )
+        match_cfg = MatchConfig(
+            fuzzy_title_threshold=0.86,
+            min_description_hits_for_non_exact_title=2,
+            min_score_to_alert=28,
+        )
 
-            if not jobs:
-                break  # no more pages for this query
+        for q in QUERIES:
+            inc(stats, "queries")
+            for page in range(1, ADZUNA_PAGES_PER_QUERY + 1):
+                inc(stats, "pages_checked")
 
-            for j in jobs:
-                title = (j.get("title") or "").strip()
-                company = ((j.get("company") or {}).get("display_name") or "").strip()
-                location = ((j.get("location") or {}).get("display_name") or "").strip()
-                link = (j.get("redirect_url") or "").strip()
-                description = (j.get("description") or "").strip()
-
-                if not title or not company or not link:
-                    continue
-
-                # Filter obvious noise early
-                if not is_mech_related_title(title):
-                    continue
-
-                # Keep UK-focused results
-                if not is_uk_job(title, company, location, description):
-                    continue
-
-                job_key = str(j.get("id") or link)
-                if already_seen(con, job_key):
-                    continue
-
-                sponsor_info = sponsor_match(company, sponsors)
-                if not sponsor_info:
-                    continue
-
-                job_for_score = {
-                    "title": title,
-                    "company": company,
-                    "description": description,
-                    "location": location,
-                    "url": link,
-                }
-
-                score_result = score_job_posting(
-                    job_for_score,
-                    target_job_titles=TARGET_JOB_TITLES,
-                    title_keywords=TITLE_KEYWORDS,
-                    description_include_keywords=DESCRIPTION_INCLUDE_KEYWORDS,
-                    exclude_keywords=EXCLUDE_KEYWORDS,
-                    sponsorship_relevance_hints=SPONSORSHIP_RELEVANCE_HINTS,
-                    core_titles_high_priority=CORE_TITLES_HIGH_PRIORITY,
-                    sponsor_companies_norm=None,
-                    config=match_cfg,
+                jobs = fetch_adzuna_jobs(
+                    adzuna_id,
+                    adzuna_key,
+                    what=q,
+                    page=page,
+                    results_per_page=MAX_JOBS_PER_QUERY,
+                    max_days_old=ADZUNA_MAX_DAYS_OLD,
                 )
 
-                if not score_result["accepted"]:
-                    continue
+                if not jobs:
+                    # Stop paging this query if current page is empty
+                    break
 
-                line = f"{title} | {company} | {location} | {link}"
-                new_lines.append(line)
-                mark_seen(con, job_key)
+                inc(stats, "pages_nonempty")
+                inc(stats, "jobs_fetched", len(jobs))
 
-    if not new_lines:
-        tg_send_multi(bot_token, chat_ids, "No new sponsor-licensed engineering jobs found today.")
-        return
+                for j in jobs:
+                    title = (j.get("title") or "").strip()
+                    company = ((j.get("company") or {}).get("display_name") or "").strip()
+                    location = ((j.get("location") or {}).get("display_name") or "").strip()
+                    link = (j.get("redirect_url") or "").strip()
+                    description = (j.get("description") or "").strip()
 
-    new_lines = sorted(set(new_lines), key=lambda s: s.lower())
+                    if not title or not company or not link:
+                        inc(stats, "skip_missing_fields")
+                        continue
 
-    header = "Today’s new sponsor-licensed engineering jobs:\n"
-    chunks = chunk_lines([header] + new_lines)
+                    if not is_mech_related_title(title):
+                        inc(stats, "skip_title_filter")
+                        continue
 
-    for msg in chunks:
-        tg_send_multi(bot_token, chat_ids, msg)
+                    if not is_uk_job(title, company, location, description):
+                        inc(stats, "skip_non_uk")
+                        continue
 
-def send_admin_debug(bot_token: str, text: str) -> None:
-    admin_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "").strip()
-    if not admin_id:
-        return
-    tg_send(bot_token, admin_id, text)
+                    job_key = str(j.get("id") or link)
+                    if already_seen(con, job_key):
+                        inc(stats, "skip_seen")
+                        continue
+
+                    sponsor_info = sponsor_match(company, sponsors)
+                    if not sponsor_info:
+                        inc(stats, "skip_sponsor")
+                        continue
+
+                    job_for_score = {
+                        "title": title,
+                        "company": company,
+                        "description": description,
+                        "location": location,
+                        "url": link,
+                    }
+
+                    score_result = score_job_posting(
+                        job_for_score,
+                        target_job_titles=TARGET_JOB_TITLES,
+                        title_keywords=TITLE_KEYWORDS,
+                        description_include_keywords=DESCRIPTION_INCLUDE_KEYWORDS,
+                        exclude_keywords=EXCLUDE_KEYWORDS,
+                        sponsorship_relevance_hints=SPONSORSHIP_RELEVANCE_HINTS,
+                        core_titles_high_priority=CORE_TITLES_HIGH_PRIORITY,
+                        sponsor_companies_norm=None,  # sponsor check already done above
+                        config=match_cfg,
+                    )
+
+                    if not score_result["accepted"]:
+                        inc(stats, "skip_score")
+                        add_reason_count(stats, str(score_result.get("reject_reason") or "unknown"))
+                        continue
+
+                    line = f"{title} | {company} | {location} | {link}"
+                    new_lines.append(line)
+                    inc(stats, "accepted_before_dedupe")
+
+                    if len(stats["sample_sent"]) < 3:
+                        stats["sample_sent"].append(line)
+
+                    mark_seen(con, job_key)
+
+        if not new_lines:
+            stats["unique_lines"] = 0
+            stats["digest_chunks"] = 1
+            tg_send_multi(bot_token, chat_ids, "No new sponsor-licensed engineering jobs found today.")
+            maybe_send_debug_summary(bot_token, stats, status="ok_no_new_jobs")
+            return
+
+        new_lines = sorted(set(new_lines), key=lambda s: s.lower())
+        stats["unique_lines"] = len(new_lines)
+
+        header = "Today’s new sponsor-licensed engineering jobs:\n"
+        chunks = chunk_lines([header] + new_lines)
+        stats["digest_chunks"] = len(chunks)
+
+        for msg in chunks:
+            tg_send_multi(bot_token, chat_ids, msg)
+
+        maybe_send_debug_summary(bot_token, stats, status="ok_sent")
+
+    except Exception as e:
+        error_text = f"{type(e).__name__}: {e}"
+        try:
+            maybe_send_debug_summary(bot_token, stats, status="error", error_text=error_text)
+        except Exception:
+            pass
+        raise
+
 
 if __name__ == "__main__":
     main()
-
