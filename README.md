@@ -12,7 +12,7 @@ Then it sends alerts to Telegram.
 
 ---
 
-## Why this project exists
+## Why this project exists and why it was made
 
 Searching for visa-sponsoring jobs manually is time-consuming and noisy.
 
